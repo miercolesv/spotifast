@@ -1,0 +1,33 @@
+name: Build Mac app
+
+on:
+  push:
+    branches: [speed-and-pitch]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Bundle
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          bash packaging/macos/bundle.sh target/release/spotifast dist/Spotifast.app "$version"
+          # ditto keeps the app's permissions and signature intact in the zip.
+          ditto -c -k --keepParent dist/Spotifast.app dist/Spotifast.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Spotifast-app
+          path: dist/Spotifast.zip
+          if-no-files-found: error
