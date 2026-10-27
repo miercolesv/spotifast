@@ -149,6 +149,9 @@ pub struct Tapped {
     control: Arc<crate::sink::AudioControl>,
     tap: Arc<AudioTap>,
     eq: crate::eq::Processor,
+    /// Speed and pitch, before everything else, so the equalizer, the
+    /// visualisers and the limiter all see the sound that is heard.
+    stretch: crate::stretch::Processor,
     /// Player volume, used to calculate the limiter ceiling.
     volume: Box<dyn VolumeGetter + Send>,
     /// Whether this wrapper applies volume after the tap. Otherwise the inner
@@ -176,6 +179,7 @@ impl Tapped {
             control,
             tap,
             eq: crate::eq::Processor::new(eq),
+            stretch: crate::stretch::Processor::new(),
             volume,
             applies_volume,
             limiter: crate::limiter::Limiter::new(f64::from(SAMPLE_RATE)),
@@ -212,11 +216,17 @@ impl Sink for Tapped {
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         if self.control.take_processing_reset() {
             self.eq.reset();
+            self.stretch.reset();
             self.limiter = crate::limiter::Limiter::new(f64::from(SAMPLE_RATE));
             self.tap.clear();
         }
         let packet = match packet {
-            AudioPacket::Samples(mut samples) => {
+            AudioPacket::Samples(samples) => {
+                let mut samples = self.stretch.process(samples);
+                if samples.is_empty() {
+                    // Still filling: speed and pitch hold a grain or two.
+                    return Ok(());
+                }
                 self.eq.process(&mut samples);
                 // Post-EQ, pre-volume, pre-normalisation: the equalizer
                 // shapes what the bars show; the volume knob and the

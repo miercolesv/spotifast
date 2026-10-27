@@ -18,6 +18,8 @@ const TINT_FADE_SECONDS: f32 = 0.45;
 const TINT_SESSION_ID: &str = "player-bar-tint-session";
 /// The Add to playlist menu a liked song's heart opens.
 const LIKED_POPUP_ID: &str = "player-bar-liked-playlists";
+/// The speed and pitch sliders the speed button opens.
+const SPEED_POPUP_ID: &str = "player-bar-speed";
 /// How strongly the visualizer shows through behind the controls: the
 /// spectrum's bars fade from their foot to their top, with a glow around
 /// them, a brighter cap above, and a pulse along the foot with the bass.
@@ -1049,6 +1051,16 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_
     {
         app.actions.push(Action::ToggleLyricsPanel);
     }
+    // Speed and pitch shape this computer's output only, so the button
+    // shows while nothing plays elsewhere. It gives way to the transport
+    // before the panels' buttons do.
+    if !remote {
+        let width = speed_button_width(ui, app);
+        let left = ui.min_rect().left() - ui.spacing().item_spacing.x - width;
+        if left - transport_right >= TRANSPORT_GAP {
+            speed_button(app, ui, width);
+        }
+    }
     // The Listening activity button is the first to go in a narrow window,
     // so it never crowds the transport.
     let left = ui.min_rect().left() - ui.spacing().item_spacing.x - (18.0 + theme::ICON_BUTTON_PAD);
@@ -1068,6 +1080,205 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_
         .clicked()
     {
         app.actions.push(Action::ToggleFriendsPanel);
+    }
+}
+
+/// The Speed and pitch button's text: the speed, and the pitch when it
+/// has moved, as in "1.25× +3".
+fn speed_text(tempo: f32, semitones: f32) -> String {
+    let tempo = format!("{tempo:.2}");
+    let tempo = tempo.trim_end_matches('0').trim_end_matches('.');
+    if semitones == 0.0 {
+        format!("{tempo}×")
+    } else if semitones > 0.0 {
+        format!("{tempo}× +{semitones:.0}")
+    } else {
+        format!("{tempo}× \u{2212}{:.0}", -semitones)
+    }
+}
+
+fn speed_button_width(ui: &egui::Ui, app: &App) -> f32 {
+    let speed = crate::stretch::speed();
+    let text = speed_text(speed.tempo(), speed.semitones());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, theme::semibold(11.5), app.palette.text);
+    (galley.size().x + 14.0).max(30.0)
+}
+
+/// Normal speed sits in the middle of its slider: half for slowing down to
+/// 0.5×, half for speeding up to 2×.
+fn tempo_fraction(tempo: f32) -> f32 {
+    if tempo <= 1.0 {
+        tempo - 0.5
+    } else {
+        0.5 + (tempo - 1.0) / 2.0
+    }
+}
+
+fn fraction_tempo(fraction: f32) -> f32 {
+    if fraction <= 0.5 {
+        0.5 + fraction
+    } else {
+        1.0 + (fraction - 0.5) * 2.0
+    }
+}
+
+fn pitch_fraction(semitones: f32) -> f32 {
+    (semitones + crate::stretch::PITCH_RANGE) / (2.0 * crate::stretch::PITCH_RANGE)
+}
+
+fn fraction_pitch(fraction: f32) -> f32 {
+    fraction * 2.0 * crate::stretch::PITCH_RANGE - crate::stretch::PITCH_RANGE
+}
+
+/// The speed shown on a button that opens the speed and pitch sliders.
+fn speed_button(app: &mut App, ui: &mut egui::Ui, width: f32) {
+    let palette = app.palette;
+    let speed = crate::stretch::speed();
+    let (tempo, semitones) = (speed.tempo(), speed.semitones());
+    let changed = !speed.is_normal();
+    let name = gettext(app.locale, "Speed and pitch");
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &*name)
+    });
+    let popup_id = egui::Id::new(SPEED_POPUP_ID);
+    let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let colour = if changed || open {
+        palette.accent
+    } else if response.hovered() {
+        palette.text
+    } else {
+        palette.secondary
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        speed_text(tempo, semitones),
+        theme::semibold(11.5),
+        colour,
+    );
+    theme::focus_ring(ui, &response);
+    let response = if open {
+        response
+    } else {
+        response.on_hover_text(&*name)
+    };
+    egui::Popup::menu(&response)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .frame(super::widgets::menu_frame(&palette))
+        .show(|ui| speed_menu(app, ui, tempo, semitones));
+}
+
+fn speed_menu(app: &mut App, ui: &mut egui::Ui, tempo: f32, semitones: f32) {
+    let palette = app.palette;
+    const WIDTH: f32 = 200.0;
+    ui.set_width(WIDTH);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    let row = |ui: &mut egui::Ui, name: &str, value: String| {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(name)
+                    .font(theme::medium(12.5))
+                    .color(palette.text),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(value)
+                        .font(theme::semibold(12.5))
+                        .color(palette.secondary),
+                );
+            });
+        });
+    };
+    let speed_name = gettext(app.locale, "Speed");
+    row(ui, &speed_name, speed_text(tempo, 0.0));
+    match thin_slider(
+        ui,
+        &palette,
+        egui::Id::new("speed-slider"),
+        &speed_name,
+        tempo_fraction(tempo),
+        WIDTH,
+        Some(0.05),
+    ) {
+        SliderEvent::Dragging(value) | SliderEvent::Committed(value) => {
+            app.actions.push(Action::SetSpeed {
+                tempo: fraction_tempo(value),
+                semitones,
+            });
+        }
+        SliderEvent::None => {}
+    }
+    ui.add_space(6.0);
+    let pitch_name = gettext(app.locale, "Pitch (semitones)");
+    let pitch = if semitones > 0.0 {
+        format!("+{semitones:.0}")
+    } else if semitones < 0.0 {
+        format!("\u{2212}{:.0}", -semitones)
+    } else {
+        "0".to_string()
+    };
+    row(ui, &pitch_name, pitch);
+    match thin_slider(
+        ui,
+        &palette,
+        egui::Id::new("pitch-slider"),
+        &pitch_name,
+        pitch_fraction(semitones),
+        WIDTH,
+        Some(1.0 / (2.0 * crate::stretch::PITCH_RANGE)),
+    ) {
+        SliderEvent::Dragging(value) | SliderEvent::Committed(value) => {
+            app.actions.push(Action::SetSpeed {
+                tempo,
+                semitones: fraction_pitch(value),
+            });
+        }
+        SliderEvent::None => {}
+    }
+    ui.add_space(4.0);
+    super::widgets::menu_separator(ui, &palette);
+    if super::widgets::menu_item_enabled(
+        ui,
+        &palette,
+        Some(Icon::Refresh),
+        &gettext(app.locale, "Reset"),
+        tempo != 1.0 || semitones != 0.0,
+    ) {
+        app.actions.push(Action::SetSpeed {
+            tempo: 1.0,
+            semitones: 0.0,
+        });
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    #[test]
+    fn normal_speed_sits_in_the_middle_of_its_slider() {
+        assert_eq!(tempo_fraction(1.0), 0.5);
+        assert_eq!(tempo_fraction(0.5), 0.0);
+        assert_eq!(tempo_fraction(2.0), 1.0);
+        for tempo in [0.5, 0.75, 1.0, 1.25, 2.0] {
+            assert!((fraction_tempo(tempo_fraction(tempo)) - tempo).abs() < 1e-6);
+        }
+        assert_eq!(pitch_fraction(0.0), 0.5);
+        assert_eq!(fraction_pitch(1.0), 12.0);
+    }
+
+    #[test]
+    fn the_button_shows_speed_and_any_pitch() {
+        assert_eq!(speed_text(1.0, 0.0), "1×");
+        assert_eq!(speed_text(1.25, 0.0), "1.25×");
+        assert_eq!(speed_text(0.5, 3.0), "0.5× +3");
+        assert_eq!(speed_text(1.5, -2.0), "1.5× \u{2212}2");
     }
 }
 

@@ -227,7 +227,8 @@ impl LocalState {
     pub fn position_now(&self) -> u32 {
         match (self.playback, self.position_at) {
             (Playback::Playing, Some(at)) => {
-                let elapsed = at.elapsed().as_millis() as u32;
+                // Song time, not wall time: at 1.5x a second plays 1.5 s.
+                let elapsed = crate::stretch::speed().played_since(at).as_millis() as u32;
                 let limit = self
                     .track
                     .as_ref()

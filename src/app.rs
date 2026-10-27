@@ -2008,7 +2008,8 @@ impl App {
                 position_ms: match self.pending_local_position {
                     Some((position, at)) if at.elapsed() < OPTIMISTIC_HOLD => {
                         if self.local.playback == Playback::Playing {
-                            let elapsed = at.elapsed().as_millis() as u32;
+                            let elapsed =
+                                crate::stretch::speed().played_since(at).as_millis() as u32;
                             let limit = track.duration_ms.max(position);
                             position.saturating_add(elapsed).min(limit)
                         } else {
@@ -11134,6 +11135,9 @@ impl App {
                     self.volume_before_mute = Some(current);
                     self.set_volume(0, true);
                 }
+            }
+            Action::SetSpeed { tempo, semitones } => {
+                crate::stretch::speed().set(tempo, semitones);
             }
             Action::ToggleShuffle => {
                 let shuffle = self

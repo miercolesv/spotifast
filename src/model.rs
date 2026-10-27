@@ -1169,6 +1169,12 @@ pub enum Action {
     PreviewVolume(u8),
     VolumeBy(i8),
     ToggleMute,
+    /// Speed as a factor of normal and pitch in semitones, for playback on
+    /// this computer (`crate::stretch`).
+    SetSpeed {
+        tempo: f32,
+        semitones: f32,
+    },
     ToggleShuffle,
     CycleRepeat,
     SetShuffle(bool),
