@@ -8,10 +8,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-mac-app
+  cancel-in-progress: true
+
 jobs:
   app:
     runs-on: macos-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -24,10 +30,46 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           bash packaging/macos/bundle.sh target/release/spotifast dist/Spotifast.app "$version"
-          # ditto keeps the app's permissions and signature intact in the zip.
-          ditto -c -k --keepParent dist/Spotifast.app dist/Spotifast.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Spotifast-app
-          path: dist/Spotifast.zip
-          if-no-files-found: error
+      - name: Disk image
+        run: |
+          # dmgbuild lays out the Finder window itself (no Finder or screen
+          # needed): the app on the left, an arrow, Applications on the right.
+          pipx install 'dmgbuild>=1.6,<2'
+          cat > dist/dmg-settings.py <<'EOF'
+          app = defines["app"]
+          files = [app]
+          symlinks = {"Applications": "/Applications"}
+          icon = app + "/Contents/Resources/spotifast.icns"
+          format = "UDZO"
+          background = "builtin-arrow"
+          window_rect = ((200, 120), (640, 300))
+          default_view = "icon-view"
+          show_status_bar = False
+          show_tab_view = False
+          show_toolbar = False
+          show_pathbar = False
+          show_sidebar = False
+          icon_size = 128
+          text_size = 13
+          icon_locations = {"Spotifast.app": (140, 130), "Applications": (500, 130)}
+          EOF
+          # hdiutil on GitHub's Macs sometimes fails with "Resource busy";
+          # a retry a few seconds later goes through.
+          for attempt in 1 2 3 4 5; do
+            dmgbuild -s dist/dmg-settings.py -D app=dist/Spotifast.app Spotifast dist/Spotifast.dmg && break
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            rm -f dist/Spotifast.dmg
+            sleep 10
+          done
+          hdiutil verify dist/Spotifast.dmg
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One release, always the newest build: drop the old one and its tag.
+          gh release delete latest-build --cleanup-tag --yes || true
+          gh release create latest-build dist/Spotifast.dmg \
+            --target "$GITHUB_SHA" \
+            --title "Latest build (speed and pitch)" \
+            --notes "Built from ${GITHUB_SHA::7} for Apple Silicon Macs. Open Spotifast.dmg, drag Spotifast to Applications, then run: xattr -dr com.apple.quarantine /Applications/Spotifast.app" \
+            --latest
