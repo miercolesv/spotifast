@@ -1,0 +1,361 @@
+# Builds every download the original Spotifast release has, on every push to
+# the speed-and-pitch branch or on demand from the Actions tab:
+#
+#   macOS    universal DMG (Apple Silicon and Intel), drag-to-Applications
+#   Windows  x64 and arm64: portable zip, setup program, Windows Installer
+#   Linux    x86_64 and aarch64: tar.gz, AppImage, .deb, .rpm; Flatpak (x86_64)
+#   Source   tarball, and checksums.txt for everything
+#
+# The build steps follow the original's .github/workflows/release.yml. What
+# needs the maintainer's keys is left out: Apple signing and notarization,
+# the update signature (checksums.txt.sig), and publishing to the AUR and
+# Homebrew. Once the builds succeed, they replace the fork's "latest-build"
+# release together. The Flatpak is optional there, as in the original.
+name: Build apps
+
+on:
+  push:
+    branches: [speed-and-pitch]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apps
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        run: echo "tag=v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      CMAKE_GENERATOR: Ninja
+      TAG: ${{ needs.version.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            vcpkg-triplet: x64-windows-static
+            msvc-arch: x64
+            package-target: windows-amd64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            vcpkg-triplet: arm64-windows-static
+            msvc-arch: arm64
+            package-target: windows-arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+      - name: GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev cmake libclang-dev
+      - name: GLEW for libprojectM
+        if: runner.os == 'Windows'
+        run: vcpkg install glew:${{ matrix.vcpkg-triplet }}
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="spotifast-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/spotifast.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/spotifast" "dist/$name/"
+          fi
+          cp README.md LICENSE "dist/$name/"
+          cp packaging/spotifast-portable.txt "dist/$name/"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp --parents packaging/applications/spotifast.desktop packaging/icons/spotifast.svg "dist/$name/"
+            cp --parents contrib/omarchy/spotifast.json.tpl contrib/omarchy/spotifast-theme "dist/$name/"
+          fi
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - name: AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends libarchive-tools squashfs-tools zsync
+          gem install native-packages --version 0.10.0 --no-document
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu) id=appimage-amd64 ;;
+            aarch64-unknown-linux-gnu) id=appimage-arm64 ;;
+          esac
+          native-packages build --version "${TAG#v}" --target "$id" --defer-recipes \
+            --output "$RUNNER_TEMP/appimage"
+          cp "$RUNNER_TEMP/appimage/packages/$id/appimage/"*.AppImage \
+            "$RUNNER_TEMP/appimage/packages/$id/appimage/"*.AppImage.zsync dist/
+
+
+      - name: Setup program
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:TAG.TrimStart("v")
+          $arch = "${{ matrix.target }}".Split("-")[0]
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$version" "/DArch=$arch" `
+            "/DBinary=$PWD\target\${{ matrix.target }}\release\spotifast.exe" `
+            "/DOutputDir=$PWD\dist" packaging\windows\spotifast.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Windows Installer package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$env:RUNNER_TEMP\wix;$env:PATH"
+          gem install native-packages --version 0.10.0 --no-document
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $env:TAG.TrimStart("v")
+          $payload = "dist\msi-input-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          $files = "target\${{ matrix.target }}\release\spotifast.exe", "README.md", "LICENSE", "packaging\windows\spotifast-installer.txt"
+          Copy-Item $files $payload
+          $packages = "$env:RUNNER_TEMP\windows-packages"
+          native-packages build --version $version --target ${{ matrix.package-target }} --defer-recipes --output $packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "$packages\packages\${{ matrix.package-target }}\msi\*.msi" dist\
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*-setup.exe
+            dist/*.msi
+            dist/*.AppImage
+            dist/*.AppImage.zsync
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal app
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 150
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/spotifast \
+            target/x86_64-apple-darwin/release/spotifast \
+            -output universal/spotifast
+      - name: App bundle
+        run: bash packaging/macos/bundle.sh universal/spotifast dist/Spotifast.app "${TAG#v}"
+      - name: Disk image
+        run: |
+          # dmgbuild lays out the Finder window itself (no Finder or screen
+          # needed): the app on the left, an arrow, Applications on the right.
+          pipx install 'dmgbuild>=1.6,<2'
+          cat > dist/dmg-settings.py <<'EOF'
+          app = defines["app"]
+          files = [app]
+          symlinks = {"Applications": "/Applications"}
+          icon = app + "/Contents/Resources/spotifast.icns"
+          format = "UDZO"
+          background = "builtin-arrow"
+          window_rect = ((200, 120), (640, 300))
+          default_view = "icon-view"
+          show_status_bar = False
+          show_tab_view = False
+          show_toolbar = False
+          show_pathbar = False
+          show_sidebar = False
+          icon_size = 128
+          text_size = 13
+          icon_locations = {"Spotifast.app": (140, 130), "Applications": (500, 130)}
+          EOF
+          dmg="dist/spotifast-${TAG}-macos-universal.dmg"
+          # hdiutil on GitHub's Macs sometimes fails with "Resource busy";
+          # a retry a few seconds later goes through.
+          for attempt in 1 2 3 4 5; do
+            dmgbuild -s dist/dmg-settings.py -D app=dist/Spotifast.app Spotifast "$dmg" && break
+            if [ "$attempt" = 5 ]; then exit 1; fi
+            rm -f "$dmg"
+            sleep 10
+          done
+          hdiutil verify "$dmg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  linux-inputs:
+    name: Linux package inputs
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: '*-unknown-linux-gnu'
+          path: downloaded
+          merge-multiple: true
+      - run: |
+          mkdir dist
+          cp downloaded/*-unknown-linux-gnu.tar.gz dist/
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-inputs
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  linux-packages:
+    name: Linux packages
+    needs: [version, linux-inputs]
+    permissions:
+      contents: read
+    uses: crmne/native-packages/.github/workflows/package.yml@226fb48cb375c7cb309a3e642c7228a6e00e9ebf # v0.10.0
+    with:
+      targets: linux-amd64,linux-arm64
+      version: ${{ needs.version.outputs.tag }}
+      source-artifact: linux-inputs
+      source-directory: dist
+      publish: false
+
+  flatpak:
+    name: Flatpak bundle
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: dist
+      - name: Unpack the Linux build
+        run: |
+          tar xzf "dist/spotifast-${TAG}-x86_64-unknown-linux-gnu.tar.gz" -C packaging/flatpak "spotifast-${TAG}-x86_64-unknown-linux-gnu"
+          mv "packaging/flatpak/spotifast-${TAG}-x86_64-unknown-linux-gnu" packaging/flatpak/built
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: packaging/flatpak/rocks.spotifast.Spotifast.bundle.yml
+          bundle: spotifast-${{ needs.version.outputs.tag }}-x86_64.flatpak
+          cache: false
+          upload-artifact: false
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flatpak
+          path: "*.flatpak"
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [version, build, macos, linux-packages, flatpak]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' && needs.macos.result == 'success'
+      && needs.linux-packages.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          path: downloaded
+      - name: Release files and checksums
+        run: |
+          mkdir release
+          # Every download, wherever its artifact kept it, once each.
+          find downloaded -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*-setup.exe' \
+            -o -name '*.msi' -o -name '*.AppImage' -o -name '*.AppImage.zsync' -o -name '*.dmg' \
+            -o -name '*.flatpak' -o -name '*.deb' -o -name '*.rpm' \) \
+            -exec cp --update=none {} release/ \;
+          git archive --format=tar.gz --prefix="spotifast-${TAG}/" \
+            -o "release/spotifast-${TAG}-source.tar.gz" HEAD
+          cd release
+          sha256sum -- * > checksums.txt
+          ls -l
+      - name: Replace the latest-build release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          Spotifast ${TAG} with speed and pitch controls, built from ${GITHUB_SHA::7}.
+
+          These builds are not signed, so each system asks once before opening them:
+
+          - **macOS:** open the DMG and drag Spotifast to Applications, then run \`xattr -dr com.apple.quarantine /Applications/Spotifast.app\` once.
+          - **Windows:** if Windows says it protected your PC, choose More info, then Run anyway.
+          - **Linux:** the downloads need Ubuntu 24.04 or a distribution at least as recent.
+
+          Turn off update checks in Settings: an update installs the official release, which has no speed and pitch controls.
+          EOF
+          # One release, always the newest build: drop the old one and its tag.
+          gh release delete latest-build --cleanup-tag --yes || true
+          gh release create latest-build release/* \
+            --target "$GITHUB_SHA" \
+            --title "Spotifast ${TAG} with speed and pitch (latest build)" \
+            --notes-file notes.md \
+            --latest
