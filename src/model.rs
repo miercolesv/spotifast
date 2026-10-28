@@ -1175,6 +1175,8 @@ pub enum Action {
         tempo: f32,
         semitones: f32,
     },
+    /// Pitch follows speed, as on a record player (`crate::stretch`).
+    LockPitchToSpeed(bool),
     ToggleShuffle,
     CycleRepeat,
     SetShuffle(bool),

@@ -1097,13 +1097,45 @@ fn speed_text(tempo: f32, semitones: f32) -> String {
     }
 }
 
+/// The pitch shown beside its slider: whole semitones when set on its own,
+/// a tenth of one when it follows the speed.
+fn pitch_text(semitones: f32, locked: bool) -> String {
+    let digits = usize::from(locked);
+    let magnitude = format!("{:.digits$}", semitones.abs());
+    if magnitude.trim_start_matches(['0', '.']).is_empty() {
+        "0".to_string()
+    } else if semitones > 0.0 {
+        format!("+{magnitude}")
+    } else {
+        format!("\u{2212}{magnitude}")
+    }
+}
+
+/// The lock beside the speed, while pitch follows it.
+const SPEED_LOCK_ICON: f32 = 11.0;
+const SPEED_LOCK_GAP: f32 = 3.0;
+
+/// The button's text: the speed, and the pitch when set on its own.
+fn speed_label(speed: &crate::stretch::Speed) -> String {
+    let semitones = if speed.locked() {
+        0.0
+    } else {
+        speed.semitones()
+    };
+    speed_text(speed.tempo(), semitones)
+}
+
 fn speed_button_width(ui: &egui::Ui, app: &App) -> f32 {
     let speed = crate::stretch::speed();
-    let text = speed_text(speed.tempo(), speed.semitones());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, theme::semibold(11.5), app.palette.text);
-    (galley.size().x + 14.0).max(30.0)
+    let galley =
+        ui.painter()
+            .layout_no_wrap(speed_label(speed), theme::semibold(11.5), app.palette.text);
+    let lock = if speed.locked() {
+        SPEED_LOCK_GAP + SPEED_LOCK_ICON
+    } else {
+        0.0
+    };
+    (galley.size().x + lock + 14.0).max(30.0)
 }
 
 /// Normal speed sits in the middle of its slider: half for slowing down to
@@ -1136,7 +1168,7 @@ fn fraction_pitch(fraction: f32) -> f32 {
 fn speed_button(app: &mut App, ui: &mut egui::Ui, width: f32) {
     let palette = app.palette;
     let speed = crate::stretch::speed();
-    let (tempo, semitones) = (speed.tempo(), speed.semitones());
+    let (tempo, semitones, locked) = (speed.tempo(), speed.semitones(), speed.locked());
     let changed = !speed.is_normal();
     let name = gettext(app.locale, "Speed and pitch");
     let (rect, response) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
@@ -1152,13 +1184,30 @@ fn speed_button(app: &mut App, ui: &mut egui::Ui, width: f32) {
     } else {
         palette.secondary
     };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        speed_text(tempo, semitones),
-        theme::semibold(11.5),
-        colour,
+    let galley = ui
+        .painter()
+        .layout_no_wrap(speed_label(speed), theme::semibold(11.5), colour);
+    let lock = if locked {
+        SPEED_LOCK_GAP + SPEED_LOCK_ICON
+    } else {
+        0.0
+    };
+    let left = rect.center().x - (galley.size().x + lock) / 2.0;
+    let text_rect = Rect::from_min_size(
+        pos2(left, rect.center().y - galley.size().y / 2.0),
+        galley.size(),
     );
+    ui.painter().galley(text_rect.min, galley, colour);
+    if locked {
+        let icon = Rect::from_center_size(
+            pos2(
+                text_rect.right() + SPEED_LOCK_GAP + SPEED_LOCK_ICON / 2.0,
+                rect.center().y,
+            ),
+            Vec2::splat(SPEED_LOCK_ICON),
+        );
+        theme::paint_icon(ui, Icon::Lock, icon, SPEED_LOCK_ICON, colour);
+    }
     theme::focus_ring(ui, &response);
     let response = if open {
         response
@@ -1169,10 +1218,10 @@ fn speed_button(app: &mut App, ui: &mut egui::Ui, width: f32) {
         .id(popup_id)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .frame(super::widgets::menu_frame(&palette))
-        .show(|ui| speed_menu(app, ui, tempo, semitones));
+        .show(|ui| speed_menu(app, ui, tempo, semitones, locked));
 }
 
-fn speed_menu(app: &mut App, ui: &mut egui::Ui, tempo: f32, semitones: f32) {
+fn speed_menu(app: &mut App, ui: &mut egui::Ui, tempo: f32, semitones: f32, locked: bool) {
     let palette = app.palette;
     const WIDTH: f32 = 200.0;
     ui.set_width(WIDTH);
@@ -1214,33 +1263,73 @@ fn speed_menu(app: &mut App, ui: &mut egui::Ui, tempo: f32, semitones: f32) {
         }
         SliderEvent::None => {}
     }
-    ui.add_space(6.0);
+    ui.add_space(8.0);
+    // Locked, the speed alone plays the song faster and higher, as a
+    // record does: no time stretch, so the cleanest sound.
+    let lock_name = gettext(app.locale, "Lock pitch to speed");
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.allocate_ui(vec2(WIDTH - 52.0, 0.0), |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&*lock_name)
+                        .font(theme::medium(12.5))
+                        .color(palette.text),
+                )
+                .wrap(),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(4.0);
+            let mut on = locked;
+            if super::widgets::switch(ui, &palette, &lock_name, &mut on).changed() {
+                app.actions.push(Action::LockPitchToSpeed(on));
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(gettext(
+                    app.locale,
+                    "Faster sounds higher, like a record. Cleanest sound.",
+                ))
+                .font(theme::regular(11.5))
+                .color(palette.secondary),
+            )
+            .wrap(),
+        );
+    });
+    ui.add_space(8.0);
     let pitch_name = gettext(app.locale, "Pitch (semitones)");
-    let pitch = if semitones > 0.0 {
-        format!("+{semitones:.0}")
-    } else if semitones < 0.0 {
-        format!("\u{2212}{:.0}", -semitones)
+    let shown = if locked {
+        crate::stretch::locked_semitones(tempo)
     } else {
-        "0".to_string()
+        semitones
     };
-    row(ui, &pitch_name, pitch);
-    match thin_slider(
-        ui,
-        &palette,
-        egui::Id::new("pitch-slider"),
-        &pitch_name,
-        pitch_fraction(semitones),
-        WIDTH,
-        Some(1.0 / (2.0 * crate::stretch::PITCH_RANGE)),
-    ) {
-        SliderEvent::Dragging(value) | SliderEvent::Committed(value) => {
-            app.actions.push(Action::SetSpeed {
-                tempo,
-                semitones: fraction_pitch(value),
-            });
+    row(ui, &pitch_name, pitch_text(shown, locked));
+    // Following the speed, the pitch shows where it is but isn't moved
+    // on its own.
+    ui.add_enabled_ui(!locked, |ui| {
+        match thin_slider(
+            ui,
+            &palette,
+            egui::Id::new("pitch-slider"),
+            &pitch_name,
+            pitch_fraction(shown),
+            WIDTH,
+            Some(1.0 / (2.0 * crate::stretch::PITCH_RANGE)),
+        ) {
+            SliderEvent::Dragging(value) | SliderEvent::Committed(value) => {
+                app.actions.push(Action::SetSpeed {
+                    tempo,
+                    semitones: fraction_pitch(value),
+                });
+            }
+            SliderEvent::None => {}
         }
-        SliderEvent::None => {}
-    }
+    });
     ui.add_space(4.0);
     super::widgets::menu_separator(ui, &palette);
     if super::widgets::menu_item_enabled(
@@ -1271,6 +1360,22 @@ mod speed_tests {
         }
         assert_eq!(pitch_fraction(0.0), 0.5);
         assert_eq!(fraction_pitch(1.0), 12.0);
+    }
+
+    #[test]
+    fn pitch_reads_in_semitones_or_tenths_when_locked() {
+        assert_eq!(pitch_text(0.0, false), "0");
+        assert_eq!(pitch_text(3.0, false), "+3");
+        assert_eq!(pitch_text(-5.0, false), "\u{2212}5");
+        assert_eq!(
+            pitch_text(crate::stretch::locked_semitones(1.25), true),
+            "+3.9"
+        );
+        assert_eq!(
+            pitch_text(crate::stretch::locked_semitones(0.5), true),
+            "\u{2212}12.0"
+        );
+        assert_eq!(pitch_text(0.0, true), "0");
     }
 
     #[test]

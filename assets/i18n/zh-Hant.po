@@ -305,19 +305,27 @@ msgstr "待播清單"
 msgid "Lyrics"
 msgstr "歌詞"
 
-#: src/ui/player_bar.rs:1141
+#: src/ui/player_bar.rs:1173
 msgid "Speed and pitch"
 msgstr "速度與音調"
 
-#: src/ui/player_bar.rs:1198
+#: src/ui/player_bar.rs:1247
 msgid "Speed"
 msgstr "速度"
 
-#: src/ui/player_bar.rs:1218
+#: src/ui/player_bar.rs:1305
 msgid "Pitch (semitones)"
 msgstr "音調（半音）"
 
-#: src/ui/player_bar.rs:1250
+#: src/ui/player_bar.rs:1269
+msgid "Lock pitch to speed"
+msgstr "音調隨速度變化"
+
+#: src/ui/player_bar.rs:1296
+msgid "Faster sounds higher, like a record. Cleanest sound."
+msgstr "像唱片一樣，越快音調越高。音質最純淨。"
+
+#: src/ui/player_bar.rs:1339
 msgid "Reset"
 msgstr "重設"
 

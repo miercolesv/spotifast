@@ -11139,6 +11139,7 @@ impl App {
             Action::SetSpeed { tempo, semitones } => {
                 crate::stretch::speed().set(tempo, semitones);
             }
+            Action::LockPitchToSpeed(locked) => crate::stretch::speed().set_locked(locked),
             Action::ToggleShuffle => {
                 let shuffle = self
                     .now_playing()

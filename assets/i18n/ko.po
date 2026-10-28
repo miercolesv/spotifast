@@ -305,19 +305,27 @@ msgstr "재생목록"
 msgid "Lyrics"
 msgstr "가사"
 
-#: src/ui/player_bar.rs:1141
+#: src/ui/player_bar.rs:1173
 msgid "Speed and pitch"
 msgstr "속도 및 피치"
 
-#: src/ui/player_bar.rs:1198
+#: src/ui/player_bar.rs:1247
 msgid "Speed"
 msgstr "속도"
 
-#: src/ui/player_bar.rs:1218
+#: src/ui/player_bar.rs:1305
 msgid "Pitch (semitones)"
 msgstr "피치(반음)"
 
-#: src/ui/player_bar.rs:1250
+#: src/ui/player_bar.rs:1269
+msgid "Lock pitch to speed"
+msgstr "피치를 속도에 연동"
+
+#: src/ui/player_bar.rs:1296
+msgid "Faster sounds higher, like a record. Cleanest sound."
+msgstr "레코드처럼 빠를수록 높게 들립니다. 가장 깨끗한 음질입니다."
+
+#: src/ui/player_bar.rs:1339
 msgid "Reset"
 msgstr "초기화"
 

@@ -1,9 +1,11 @@
 //! Playback speed and pitch for local playback.
 //!
-//! Speed and pitch are independent. Speed changes how fast the song plays
-//! without changing its key; pitch moves the key in semitones without
-//! changing its speed. Both apply to this computer's output only, like the
-//! equalizer; a Connect device or Cast speaker plays at normal speed.
+//! Speed and pitch are independent by default. Speed changes how fast the
+//! song plays without changing its key; pitch moves the key in semitones
+//! without changing its speed. Locked together, they move as a record does
+//! played faster or slower: 1.5× plays a fifth higher. Both apply to this
+//! computer's output only, like the equalizer; a Connect device or Cast
+//! speaker plays at normal speed.
 //!
 //! Two stages do the work, both pure Rust and run on the player's thread:
 //!
@@ -13,7 +15,12 @@
 //!    continues the previous grain, so the waveform stays coherent.
 //! 2. A windowed-sinc resampler with a variable ratio moves the pitch, and
 //!    the first stage is asked for the matching extra stretch so the speed
-//!    is unchanged. Pitch up lowers the cutoff first, so it doesn't alias.
+//!    is unchanged. Its 128-tap Kaiser kernel passes everything up to about
+//!    20 kHz and rejects what would alias by about 100 dB.
+//!
+//! Locked, the first stage has nothing to do and passes the audio through
+//! sample for sample: the resampler alone plays the song faster or slower,
+//! which leaves none of the time stretch's artefacts.
 //!
 //! At normal speed and pitch the processor is bypassed and the samples go
 //! through untouched. Once engaged, it keeps running (at normal settings it
@@ -21,7 +28,7 @@
 //! to normal never drops the audio it was holding.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -45,9 +52,16 @@ const SEEK: usize = SAMPLE_RATE as usize * 12 / 1000;
 /// The coarse search looks at every fourth frame, then refines.
 const COARSE: usize = 4;
 /// Input frames either side of each resampled frame.
-const TAPS_HALF: usize = 8;
-/// Kernel table entries per input frame.
-const KERNEL_STEPS: usize = 256;
+const TAPS_HALF: usize = 64;
+/// Kernel table entries per input frame; linear interpolation between them
+/// stays more than 100 dB under the signal.
+const KERNEL_STEPS: usize = 512;
+/// Half the resampler's transition band, as a fraction of the Nyquist
+/// frequency (1.1 kHz): the passband ends this far below the cutoff and the
+/// stopband starts this far above it.
+const TRANSITION: f64 = 0.05;
+/// The Kaiser window's shape for about 100 dB of stopband rejection.
+const KAISER_BETA: f64 = 10.0;
 /// Tempo changes remembered to work out how far a song has moved.
 const HISTORY: usize = 32;
 
@@ -56,6 +70,8 @@ const HISTORY: usize = 32;
 pub struct Speed {
     tempo: AtomicU32,
     semitones: AtomicU32,
+    /// Pitch follows speed, as on a record player.
+    locked: AtomicBool,
     /// When each recent tempo took effect, so a position observed before a
     /// change still extrapolates correctly after it.
     changes: Mutex<Timeline>,
@@ -72,6 +88,7 @@ impl Default for Speed {
         Self {
             tempo: AtomicU32::new(1.0f32.to_bits()),
             semitones: AtomicU32::new(0.0f32.to_bits()),
+            locked: AtomicBool::new(false),
             changes: Mutex::new(Timeline {
                 before: 1.0,
                 changes: VecDeque::new(),
@@ -93,13 +110,32 @@ impl Speed {
         f32::from_bits(self.tempo.load(Ordering::Relaxed))
     }
 
-    /// Pitch in semitones from the original.
+    /// The pitch set on its own, in semitones from the original. While
+    /// locked, [`Self::pitch`] is what plays and this waits for unlocking.
     pub fn semitones(&self) -> f32 {
         f32::from_bits(self.semitones.load(Ordering::Relaxed))
     }
 
+    /// Whether pitch follows speed.
+    pub fn locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+
+    pub fn set_locked(&self, locked: bool) {
+        self.locked.store(locked, Ordering::Relaxed);
+    }
+
+    /// The pitch that plays, in semitones: the speed's own while locked.
+    pub fn pitch(&self) -> f32 {
+        if self.locked() {
+            locked_semitones(self.tempo())
+        } else {
+            self.semitones()
+        }
+    }
+
     pub fn is_normal(&self) -> bool {
-        is_normal(self.tempo(), self.semitones())
+        is_normal(self.tempo(), self.semitones(), self.locked())
     }
 
     /// Sets both, kept within range and snapped to their steps.
@@ -155,8 +191,14 @@ impl Speed {
     }
 }
 
-fn is_normal(tempo: f32, semitones: f32) -> bool {
-    (tempo - 1.0).abs() < f32::EPSILON && semitones.abs() < f32::EPSILON
+fn is_normal(tempo: f32, semitones: f32, locked: bool) -> bool {
+    (tempo - 1.0).abs() < f32::EPSILON && (locked || semitones.abs() < f32::EPSILON)
+}
+
+/// How far a speed moves the pitch when the two are locked: 1.5× is about
+/// seven semitones up, 0.5× an octave down.
+pub fn locked_semitones(tempo: f32) -> f32 {
+    12.0 * snap_tempo(tempo).log2()
 }
 
 pub fn snap_tempo(tempo: f32) -> f32 {
@@ -200,22 +242,37 @@ impl Processor {
     /// Processes one packet at the shared speed and pitch.
     pub fn process(&mut self, samples: Vec<f64>) -> Vec<f64> {
         let speed = speed();
-        self.process_with(samples, speed.tempo(), speed.semitones())
+        self.process_with(samples, speed.tempo(), speed.semitones(), speed.locked())
     }
 
-    /// Processes one packet at the given speed and pitch. The output may be
-    /// shorter or longer than the input, and empty while it fills.
-    pub fn process_with(&mut self, samples: Vec<f64>, tempo: f32, semitones: f32) -> Vec<f64> {
+    /// Processes one packet at the given speed and pitch, or with pitch
+    /// following speed when `locked`. The output may be shorter or longer
+    /// than the input, and empty while it fills.
+    pub fn process_with(
+        &mut self,
+        samples: Vec<f64>,
+        tempo: f32,
+        semitones: f32,
+        locked: bool,
+    ) -> Vec<f64> {
         if !self.engaged {
-            if is_normal(tempo, semitones) {
+            if is_normal(tempo, semitones, locked) {
                 return samples;
             }
             *self = Self::new();
             self.engaged = true;
         }
         let tempo = f64::from(snap_tempo(tempo));
-        let ratio = 2f64.powf(f64::from(snap_semitones(semitones)) / 12.0);
-        let stretched = self.stretch.process(&samples, tempo / ratio);
+        // Locked, the resampler alone changes the speed and the stretch
+        // only passes the audio on. It keeps running, so locking or
+        // unlocking mid-song never drops the audio it holds.
+        let (stretch, ratio) = if locked {
+            (1.0, tempo)
+        } else {
+            let ratio = 2f64.powf(f64::from(snap_semitones(semitones)) / 12.0);
+            (tempo / ratio, ratio)
+        };
+        let stretched = self.stretch.process(&samples, stretch);
         self.shift.process(&stretched, ratio)
     }
 
@@ -229,7 +286,7 @@ impl Processor {
     #[cfg(test)]
     fn reset_with(&mut self, tempo: f32, semitones: f32) {
         *self = Self::new();
-        self.engaged = !is_normal(tempo, semitones);
+        self.engaged = !is_normal(tempo, semitones, false);
     }
 }
 
@@ -291,6 +348,12 @@ impl Wsola {
                 break;
             }
             let at = match self.previous {
+                // With nothing to stretch, the audio that followed the last
+                // grain continues it perfectly: the halves sum back to the
+                // input, sample for sample.
+                Some(previous) if factor == 1.0 && (previous + HOP).abs_diff(nominal) <= SEEK => {
+                    previous + HOP
+                }
                 Some(previous) => self.best_match(previous + HOP, nominal),
                 None => {
                     // The first grain's first half plays as it is: the tail
@@ -349,9 +412,14 @@ impl Wsola {
             }
             product / (energy + 1e-12).sqrt()
         };
-        // The nominal place wins ties, so steady input at normal speed
-        // comes out unchanged.
-        let mut best = nominal.max(low);
+        // The audio that followed the last grain is the perfect
+        // continuation, so it starts as the best when within reach; the
+        // nominal place otherwise. Either wins ties.
+        let mut best = if (low..=high).contains(&natural) {
+            natural
+        } else {
+            nominal.max(low)
+        };
         let mut best_score = score(best, COARSE);
         let mut candidate = nominal % COARSE + low - low % COARSE;
         while candidate <= high {
@@ -402,9 +470,16 @@ impl Shift {
     }
 
     fn process(&mut self, samples: &[f64], ratio: f64) -> Vec<f64> {
-        // Raising the pitch squeezes the spectrum up: cut what would fold
-        // back past the output's Nyquist frequency.
-        let cutoff = if ratio > 1.0 { 0.97 / ratio } else { 1.0 };
+        // Reading faster squeezes the spectrum up: everything above the
+        // output's Nyquist frequency once squeezed is cut before it can fold
+        // back. Reading slower, the images above the input's Nyquist are cut.
+        // At exactly normal speed every tap but one falls on a zero of the
+        // full-band kernel, so the samples pass through unchanged.
+        let cutoff = if ratio == 1.0 {
+            1.0
+        } else {
+            (1.0 / ratio).min(1.0) - TRANSITION
+        };
         if (cutoff - self.cutoff).abs() > f64::EPSILON || self.kernel.is_empty() {
             self.kernel = kernel(cutoff);
             self.cutoff = cutoff;
@@ -450,8 +525,8 @@ impl Shift {
     }
 }
 
-/// A Blackman-windowed sinc low-pass at `cutoff` (1 is the input's
-/// Nyquist frequency), sampled across the taps.
+/// A Kaiser-windowed sinc low-pass at `cutoff` (1 is the input's Nyquist
+/// frequency), sampled across the taps.
 fn kernel(cutoff: f64) -> Vec<f64> {
     let span = TAPS_HALF as f64;
     (0..=2 * TAPS_HALF * KERNEL_STEPS)
@@ -463,11 +538,29 @@ fn kernel(cutoff: f64) -> Vec<f64> {
                 let arg = std::f64::consts::PI * cutoff * x;
                 arg.sin() / arg
             };
-            let phase = std::f64::consts::PI * (x / span + 1.0);
-            let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+            let edge = x / span;
+            let window = bessel_i0(KAISER_BETA * (1.0 - edge * edge).max(0.0).sqrt())
+                / bessel_i0(KAISER_BETA);
             cutoff * sinc * window
         })
         .collect()
+}
+
+/// The zeroth-order modified Bessel function of the first kind, which
+/// shapes the Kaiser window, by its power series.
+fn bessel_i0(x: f64) -> f64 {
+    let half = x / 2.0;
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for k in 1..100 {
+        term *= half / k as f64;
+        let squared = term * term;
+        sum += squared;
+        if squared < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -488,10 +581,104 @@ mod tests {
 
     /// Feeds `input` in librespot-sized packets.
     fn run(processor: &mut Processor, input: &[f64], tempo: f32, semitones: f32) -> Vec<f64> {
+        feed(processor, input, tempo, semitones, false)
+    }
+
+    /// The same with pitch following speed.
+    fn run_locked(processor: &mut Processor, input: &[f64], tempo: f32) -> Vec<f64> {
+        feed(processor, input, tempo, 0.0, true)
+    }
+
+    fn feed(
+        processor: &mut Processor,
+        input: &[f64],
+        tempo: f32,
+        semitones: f32,
+        locked: bool,
+    ) -> Vec<f64> {
         input
             .chunks(1024 * CHANNELS)
-            .flat_map(|chunk| processor.process_with(chunk.to_vec(), tempo, semitones))
+            .flat_map(|chunk| processor.process_with(chunk.to_vec(), tempo, semitones, locked))
             .collect()
+    }
+
+    /// The middle half of the left channel.
+    fn middle(samples: &[f64]) -> Vec<f64> {
+        let left: Vec<f64> = samples.iter().step_by(CHANNELS).copied().collect();
+        left[left.len() / 4..left.len() * 3 / 4].to_vec()
+    }
+
+    fn rms(samples: &[f64]) -> f64 {
+        (samples.iter().map(|s| s * s).sum::<f64>() / samples.len() as f64).sqrt()
+    }
+
+    /// How far everything else is below the tones at `hz`, in decibels
+    /// (signal to noise and distortion). The tones are fitted by least
+    /// squares in each 93 ms block of the middle of the left channel, so a
+    /// stretch's slow drift in phase isn't counted, only what it adds.
+    fn sinad_db(samples: &[f64], hz: &[f64]) -> f64 {
+        const BLOCK: usize = 4096;
+        let signal = middle(samples);
+        let (mut residual, mut fitted) = (0.0, 0.0);
+        for (index, block) in signal.as_chunks::<BLOCK>().0.iter().enumerate() {
+            let (r, f) = fit_block(block, index * BLOCK, hz);
+            residual += r;
+            fitted += f;
+        }
+        10.0 * (fitted / residual.max(1e-300)).log10()
+    }
+
+    /// The energy a block leaves after fitting the tones, and theirs.
+    fn fit_block(block: &[f64], offset: usize, hz: &[f64]) -> (f64, f64) {
+        let size = hz.len() * 2 + 1;
+        let basis = |i: usize| {
+            let mut row: Vec<f64> = hz
+                .iter()
+                .flat_map(|hz| {
+                    let phase = std::f64::consts::TAU * hz * (offset + i) as f64 / RATE;
+                    [phase.sin(), phase.cos()]
+                })
+                .collect();
+            row.push(1.0);
+            row
+        };
+        // The normal equations, solved by Gaussian elimination.
+        let mut gram = vec![vec![0.0; size]; size];
+        let mut fit = vec![0.0; size];
+        for (i, sample) in block.iter().enumerate() {
+            let b = basis(i);
+            for row in 0..size {
+                fit[row] += b[row] * sample;
+                for column in 0..size {
+                    gram[row][column] += b[row] * b[column];
+                }
+            }
+        }
+        for pivot in 0..size {
+            for row in pivot + 1..size {
+                let factor = gram[row][pivot] / gram[pivot][pivot];
+                let pivot_row = gram[pivot].clone();
+                for (cell, above) in gram[row].iter_mut().zip(&pivot_row).skip(pivot) {
+                    *cell -= factor * above;
+                }
+                fit[row] -= factor * fit[pivot];
+            }
+        }
+        for row in (0..size).rev() {
+            let known: f64 = (row + 1..size)
+                .map(|column| gram[row][column] * fit[column])
+                .sum();
+            fit[row] = (fit[row] - known) / gram[row][row];
+        }
+        let mut residual = 0.0;
+        let mut fitted = 0.0;
+        for (i, sample) in block.iter().enumerate() {
+            let b = basis(i);
+            let tones: f64 = (0..size - 1).map(|k| fit[k] * b[k]).sum();
+            residual += (sample - tones - fit[size - 1]).powi(2);
+            fitted += tones * tones;
+        }
+        (residual, fitted)
     }
 
     /// The dominant frequency of the left channel, by counting rising zero
@@ -591,6 +778,134 @@ mod tests {
         for (out, expected) in produced.iter().zip(&input[input.len() / 2..]) {
             assert!((out - expected).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn locked_pitch_follows_speed() {
+        let input = tone(440.0, 4.0);
+        for tempo in [0.5, 0.8, 1.25, 1.5, 2.0] {
+            let output = run_locked(&mut Processor::new(), &input, tempo);
+            let expected = frames(&input) / f64::from(tempo);
+            let length = frames(&output);
+            // Only what the stages still hold is missing, and it would
+            // play for longer the slower the speed.
+            let held = (GRAIN + SEEK + TAPS_HALF) as f64 / f64::from(tempo);
+            assert!(
+                (length - expected).abs() < held,
+                "tempo {tempo}: {length} frames, expected about {expected}"
+            );
+            let pitched = 440.0 * f64::from(tempo);
+            let hz = frequency(&output);
+            assert!(
+                (hz - pitched).abs() < pitched * 0.01,
+                "tempo {tempo}: {hz} Hz, expected {pitched}"
+            );
+        }
+    }
+
+    #[test]
+    fn locked_playback_is_clean() {
+        // A pure tone through the locked chain: everything that isn't the
+        // tone, from filtering or interpolation, is over 110 dB under it.
+        let input = tone(1000.0, 3.0);
+        for tempo in [0.5f32, 0.8, 1.25, 1.5, 2.0] {
+            let output = run_locked(&mut Processor::new(), &input, tempo);
+            let clean = sinad_db(&output, &[1000.0 * f64::from(tempo)]);
+            eprintln!("1 kHz locked at {tempo}x: {clean:.1} dB");
+            assert!(clean > 110.0, "tempo {tempo}: {clean:.1} dB");
+        }
+    }
+
+    #[test]
+    fn locking_avoids_the_stretchs_artefacts() {
+        // A chord, two notes a major third apart, is where a time stretch
+        // has to compromise: no one grain lines up with both. Locked, the
+        // chord comes through as cleanly as a single tone.
+        let (low, high) = (440.0, 440.0 * 2f64.powf(4.0 / 12.0));
+        let frames = (RATE * 3.0) as usize;
+        let input: Vec<f64> = (0..frames)
+            .flat_map(|i| {
+                let t = i as f64 / RATE;
+                let sample = 0.25 * (std::f64::consts::TAU * low * t).sin()
+                    + 0.25 * (std::f64::consts::TAU * high * t).sin();
+                [sample, sample]
+            })
+            .collect();
+        for tempo in [0.8f32, 1.25, 1.5] {
+            let ratio = f64::from(tempo);
+            let locked = sinad_db(
+                &run_locked(&mut Processor::new(), &input, tempo),
+                &[low * ratio, high * ratio],
+            );
+            let stretched = sinad_db(
+                &run(&mut Processor::new(), &input, tempo, 0.0),
+                &[low, high],
+            );
+            eprintln!("chord at {tempo}x: locked {locked:.1} dB, pitch kept {stretched:.1} dB");
+            assert!(locked > 110.0, "tempo {tempo}: {locked:.1} dB");
+            assert!(locked > stretched + 40.0);
+        }
+    }
+
+    #[test]
+    fn locked_speed_up_removes_what_would_alias() {
+        // At 2× a 15 kHz tone would play at 30 kHz, above what the output
+        // can hold; instead of folding back as a false tone, it is gone.
+        let input = tone(15_000.0, 2.0);
+        let output = run_locked(&mut Processor::new(), &input, 2.0);
+        let level = 20.0 * (rms(&middle(&output)) / rms(&middle(&input))).log10();
+        eprintln!("15 kHz at 2x: {level:.1} dB");
+        assert!(level < -90.0, "{level:.1} dB");
+    }
+
+    #[test]
+    fn locked_slow_down_keeps_the_top_octave() {
+        // 18 kHz at 0.8× plays at 14.4 kHz, at the level it had.
+        let input = tone(18_000.0, 2.0);
+        let output = run_locked(&mut Processor::new(), &input, 0.8);
+        let level = 20.0 * (rms(&middle(&output)) / rms(&middle(&input))).log10();
+        assert!(level.abs() < 0.05, "{level:.3} dB");
+        // 0.8 as the speed holds it, which is a hair over 0.8.
+        let clean = sinad_db(&output, &[18_000.0 * f64::from(0.8f32)]);
+        eprintln!("18 kHz at 0.8x: {clean:.1} dB");
+        assert!(clean > 110.0, "{clean:.1} dB");
+    }
+
+    #[test]
+    fn locking_mid_song_keeps_every_moment() {
+        // Speed and pitch kept for a second, then locked at the same speed:
+        // the song carries on with nothing dropped or repeated.
+        let input = tone(440.0, 4.0);
+        let half = input.len() / 2;
+        let mut processor = Processor::new();
+        let mut output = run(&mut processor, &input[..half], 1.25, 0.0);
+        output.extend(run_locked(&mut processor, &input[half..], 1.25));
+        let expected = frames(&input) / 1.25;
+        assert!(
+            (frames(&output) - expected).abs() < (GRAIN + SEEK + HOP + TAPS_HALF) as f64,
+            "{} frames, expected about {expected}",
+            frames(&output)
+        );
+        let after = &output[output.len() * 3 / 4..];
+        let hz = frequency(after);
+        assert!((hz - 550.0).abs() < 6.0, "{hz} Hz");
+    }
+
+    #[test]
+    fn a_locked_speed_sets_the_pitch() {
+        assert!((locked_semitones(1.5) - 7.02).abs() < 0.01);
+        assert!((locked_semitones(0.5) + 12.0).abs() < 1e-6);
+        assert_eq!(locked_semitones(1.0), 0.0);
+        let speed = Speed::default();
+        speed.set(1.0, 5.0);
+        speed.set_locked(true);
+        // Locked at normal speed plays at normal pitch, whatever the pitch
+        // slider holds for later.
+        assert!(speed.is_normal());
+        assert_eq!(speed.pitch(), 0.0);
+        speed.set_locked(false);
+        assert_eq!(speed.pitch(), 5.0);
+        assert!(!speed.is_normal());
     }
 
     #[test]
